@@ -12,7 +12,7 @@ local localPlayer = Players.LocalPlayer
 -- Backend
 local BACKEND_URL = 'https://brainrotss.up.railway.app/brainrots'
 
--- // Eps1lon Hub Notifier Integration //
+-- // Eps1llon Hub Notifier Integration //
 local DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1402730478989082716/WzT96zfVL3Ep0Qrw1cyF1lIUJhlGxju3vLNW72tULQl6dLqTbprSFzwIGut80bgwBGCg"
 local MIN_DPS_THRESHOLD = 1000000 -- 1M
 
@@ -129,6 +129,8 @@ local moneyFilter, filterDropdownOpen = 0, false
 
 -- Search/Auto-Join state
 local autoJoinMode, searchActive, searchTarget = nil, false, nil
+local joinAttempts = {} -- Track join attempts per server
+local MAX_JOIN_ATTEMPTS = 3
 
 -- Minimize/Expand state
 local isMinimized, originalSize = false, nil
@@ -372,7 +374,7 @@ local function stopFreezerKiller()
     end
 end
 
--- Apply settings function
+-- Enhanced Apply Settings function with full reinitialization
 local function applySettings()
     -- Apply speed hack settings
     SpeedHack.Enabled = settings.speedHackEnabled
@@ -454,6 +456,43 @@ local function applySettings()
     
     -- Update brainrot ESP
     visualizeSecretsOnly()
+    
+    -- Reinitialize connections to ensure all features work
+    reinitializeConnections()
+end
+
+-- Function to reinitialize all connections after loading settings
+local function reinitializeConnections()
+    -- Restart insta brainrot
+    stopInstaBrainrot()
+    startInstaBrainrot()
+    
+    -- Restart infinite jump
+    stopInfJump()
+    startInfJump()
+    
+    -- Restart player ESP connections
+    cleanupPlayerVisuals()
+    updateAllPlayers()
+    
+    -- Restart brainrot ESP
+    cleanupSecretVisuals()
+    visualizeSecretsOnly()
+    
+    -- Restart base timer ESP
+    updateBaseTimerESP()
+    
+    -- Restart performance optimizations if enabled
+    if reducedGraphicsEnabled then
+        applyReducedGraphics(true)
+        spawn(maintainPotatoGraphics)
+    end
+    
+    -- Restart freezer killer if enabled
+    if settings.freezerKillerEnabled then
+        stopFreezerKiller()
+        startFreezerKiller()
+    end
 end
 
 -- Load settings on startup if autoLoad is enabled
@@ -1106,15 +1145,25 @@ task.spawn(function()
     end
 end)
 
-Players.PlayerAdded:Connect(function()
+Players.PlayerAdded:Connect(function(player)
+    -- Monitor new players and update ESP when their character loads
+    player.CharacterAdded:Connect(function(char)
+        task.wait(0.5) -- Wait for character to fully load
+        if playerESPEnabled or hotbarESPEnabled then
+            updateAllPlayers()
+        end
+    end)
+    
     task.wait(0.5)
     updateAllPlayers()
 end)
+
 Players.PlayerRemoving:Connect(function(plr)
     removePlayerESP(plr)
     task.wait(0.1)
     updateAllPlayers()
 end)
+
 Players.PlayerAdded:Connect(function(plr)
     plr.CharacterRemoving:Connect(function()
         removePlayerESP(plr)
@@ -2528,7 +2577,7 @@ local function createToggleRow(parent, titleText, defaultValue, onToggle)
         currentState = not currentState
         updateVisuals(true)
     end)
-    
+
     -- Set initial state without animation, but still fire the callback
     task.defer(function()
         local trackColor = currentState and THEME.accentA or THEME.btn
@@ -2784,8 +2833,21 @@ local function setAutoJoin(mode)
     end
 end
 
-secretBtn.Activated:Connect(function() if autoJoinMode == 'Secret' then setAutoJoin(nil) else setAutoJoin('Secret') end end)
-godBtn.Activated:Connect(function() if autoJoinMode == 'God' then setAutoJoin(nil) else setAutoJoin('God') end end)
+secretBtn.Activated:Connect(function() 
+    if autoJoinMode == 'Secret' then 
+        setAutoJoin(nil) 
+    else 
+        setAutoJoin('Secret') 
+    end 
+end)
+
+godBtn.Activated:Connect(function() 
+    if autoJoinMode == 'God' then 
+        setAutoJoin(nil) 
+    else 
+        setAutoJoin('God') 
+    end 
+end)
 
 local filterOptions = {
     {text = 'All', value = 0},
@@ -2839,6 +2901,17 @@ end
 
 local lastData, waitingForServer = '', false
 
+-- Enhanced server sorting to prioritize most recent servers
+local function sortServersByRecency(servers)
+    -- Sort by lastSeen timestamp (most recent first)
+    table.sort(servers, function(a, b)
+        local timeA = tonumber(a.lastSeen) or 0
+        local timeB = tonumber(b.lastSeen) or 0
+        return timeA > timeB
+    end)
+    return servers
+end
+
 local function renderServers(servers)
     clearGui()
     local filtered = {}
@@ -2847,6 +2920,10 @@ local function renderServers(servers)
         local moneyValue = parseMoney(moneyPerSec)
         if moneyValue >= moneyFilter then table.insert(filtered, server) end
     end
+    
+    -- Sort by recency
+    filtered = sortServersByRecency(filtered)
+    
     if #filtered == 0 and (autoJoinMode or searchActive) then
         local waitingMsg = Instance.new('TextLabel')
         waitingMsg.Size = UDim2.new(1, -16, 0, 50)
@@ -2904,6 +2981,11 @@ local function renderServers(servers)
     end
 end
 
+-- Enhanced auto-join with retry logic and cycling
+local serverIndex = 1
+local cycleCount = 0
+local MAX_CYCLES = 3 -- Number of times to cycle through all servers
+
 local function tryAutoJoin(servers)
     local filtered = {}
     for _, server in ipairs(servers) do
@@ -2911,24 +2993,65 @@ local function tryAutoJoin(servers)
         local moneyValue = parseMoney(moneyPerSec)
         if moneyValue >= moneyFilter then table.insert(filtered, server) end
     end
+    
+    -- Sort by recency
+    filtered = sortServersByRecency(filtered)
+    
+    if #filtered == 0 then return end
+    
     if autoJoinMode then
-        for _, server in ipairs(filtered) do
-            local name = clean(server.name)
-            local petRarity = brainrotDict[name] and brainrotDict[name].rarity
-            if (autoJoinMode == 'Secret' and petRarity == 'Secret') or (autoJoinMode == 'God' and petRarity == 'Brainrot God') then
-                local jobId = clean(server.jobId or server.instanceId)
-                local mps = server.moneyPerSec and clean(server.moneyPerSec) or '?'
-                local mv = parseMoney(mps)
-                if mv >= 10000000 then
-                    local placeId = 109983668079237; task.spawn(function() pcall(function() TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) end) end)
-                else
-                    local placeId = tonumber(server.serverId)
-                    if placeId and jobId and jobId ~= '' then task.spawn(function() pcall(function() TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) end) end) end
+        -- Cycle through servers with retry logic
+        for i = 1, #filtered do
+            local server = filtered[serverIndex]
+            local jobId = clean(server.jobId or server.instanceId)
+            
+            -- Check if we've exceeded max attempts for this server
+            local attempts = joinAttempts[jobId] or 0
+            if attempts < MAX_JOIN_ATTEMPTS then
+                local name = clean(server.name)
+                local petRarity = brainrotDict[name] and brainrotDict[name].rarity
+                if (autoJoinMode == 'Secret' and petRarity == 'Secret') or (autoJoinMode == 'God' and petRarity == 'Brainrot God') then
+                    local mps = server.moneyPerSec and clean(server.moneyPerSec) or '?'
+                    local mv = parseMoney(mps)
+                    if mv >= 10000000 then
+                        local placeId = 109983668079237
+                        task.spawn(function() 
+                            pcall(function() 
+                                TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) 
+                            end) 
+                        end)
+                    else
+                        local placeId = tonumber(server.serverId)
+                        if placeId and jobId and jobId ~= '' then 
+                            task.spawn(function() 
+                                pcall(function() 
+                                    TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) 
+                                end) 
+                            end) 
+                        end
+                    end
+                    
+                    -- Increment attempt count
+                    joinAttempts[jobId] = attempts + 1
+                    break
                 end
-                break
+            end
+            
+            -- Move to next server
+            serverIndex = serverIndex + 1
+            if serverIndex > #filtered then
+                serverIndex = 1
+                cycleCount = cycleCount + 1
+                
+                -- Reset attempt counts after each cycle
+                if cycleCount >= MAX_CYCLES then
+                    joinAttempts = {}
+                    cycleCount = 0
+                end
             end
         end
     end
+    
     if searchActive and searchTarget then
         for _, server in ipairs(filtered) do
             local name = clean(server.name):lower()
@@ -2937,10 +3060,21 @@ local function tryAutoJoin(servers)
                 local mps = server.moneyPerSec and clean(server.moneyPerSec) or '?'
                 local mv = parseMoney(mps)
                 if mv >= 10000000 then
-                    local placeId = 109983668079237; task.spawn(function() pcall(function() TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) end) end)
+                    local placeId = 109983668079237
+                    task.spawn(function() 
+                        pcall(function() 
+                            TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) 
+                        end) 
+                    end)
                 else
                     local placeId = tonumber(server.serverId)
-                    if placeId and jobId and jobId ~= '' then task.spawn(function() pcall(function() TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) end) end) end
+                    if placeId and jobId and jobId ~= '' then 
+                        task.spawn(function() 
+                            pcall(function() 
+                                TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer) 
+                            end) 
+                        end) 
+                    end
                 end
                 break
             end
